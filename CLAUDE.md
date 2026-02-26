@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 ## Project Overview
 
 LLTI (Low Latency Trading Insights) explores performance-sensitive data structures for static lookup workloads. The motivating question: *Given 10M static 64-bit keys, how do we minimize per-lookup latency when data fits in RAM but not L2?*
@@ -24,6 +26,7 @@ Uses Google Test (v1.14.0, fetched via CMake FetchContent).
 ./build/llti_benchmarks
 ./build/llti_benchmarks --benchmark_filter=BM_SortedLookup_10M
 ./build/llti_benchmarks --benchmark_filter=BM_EytzingerLookup_10M
+./build/llti_benchmarks --benchmark_filter=BM_VebLookup_10M
 ```
 
 Uses Google Benchmark (v1.8.3, fetched via CMake FetchContent).
@@ -65,6 +68,7 @@ Header-only library in `include/llti/`.
 
 - **`sorted_lookup.h`** — Naive sorted array with `std::lower_bound` binary search. Baseline implementation.
 - **`eytzinger_lookup.h`** — Eytzinger (BFS) layout with branchless search and software prefetch. Keys are stored in breadth-first order of an implicit binary tree (1-indexed: node `i` has children `2i`, `2i+1`). The search loop is branchless: `i = 2*i + (keys[i] < target)` with `__builtin_prefetch` to hide memory latency. After descent, the answer is recovered via `i >>= __builtin_ffs(~i)`. Build uses in-order recursive fill from sorted input.
+- **`veb_lookup.h`** — van Emde Boas (vEB) cache-oblivious layout. Recursively splits the binary tree into top/bottom subtrees. Uses explicit child pointers packed into a 16-byte aligned `SearchData` struct (key + left/right indices). Search is branching (not branchless). Build maps BFS indices to vEB order via recursive layout generation.
 
 ## Performance Tuning Skills
 
@@ -82,6 +86,7 @@ The `skills/perf/` submodule provides performance analysis skills:
 
 - **7 tests** in `tests/lookup_test.cpp` — SortedLookup correctness
 - **9 tests** in `tests/eytzinger_test.cpp` — EytzingerLookup correctness including power-of-two, non-power-of-two sizes, and 100K random dataset
+- **9 tests** in `tests/veb_test.cpp` — VebLookup correctness (same coverage pattern as Eytzinger tests)
 
 Run a single test suite: `./build/llti_tests --gtest_filter='EytzingerLookup*'`
 
