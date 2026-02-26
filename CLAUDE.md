@@ -45,12 +45,19 @@ Uses Google Benchmark (v1.8.3, fetched via CMake FetchContent).
 
 Always does a clean rebuild with Clang 16. Benchmarks run with `taskset -c 1` on isolated cores. Uses `toplev.py --force-cpu spr` from pmu-tools (cloned to `third_party/pmu-tools`) since AWS kernels lack topdown PMU support.
 
-## Benchmark Results (WSL2, 10M int64_t keys)
+## Benchmark Results (10M int64_t keys)
 
+### WSL2 (Local)
 | Layout | Lookup Latency | vs Baseline |
 |--------|---------------|-------------|
 | Sorted + `std::lower_bound` | 292 ns | baseline |
 | Eytzinger (BFS) + branchless | 145 ns | **2.0x faster** |
+
+### AWS c7i (Intel Sapphire Rapids, Isolated Core)
+| Layout | Lookup Latency | vs Baseline |
+|--------|---------------|-------------|
+| Sorted + `std::lower_bound` | 322 ns | baseline |
+| Eytzinger (BFS) + branchless | 76.1 ns | **4.2x faster** |
 
 ## Architecture
 
