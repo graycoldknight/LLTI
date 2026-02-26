@@ -3,3 +3,6 @@ build-*/
 .cache/
 *.o
 *.a
+third_party/
+benchmark_results_*.txt
+toplev_results_*.txt

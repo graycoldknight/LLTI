@@ -28,6 +28,23 @@ Uses Google Test (v1.14.0, fetched via CMake FetchContent).
 
 Uses Google Benchmark (v1.8.3, fetched via CMake FetchContent).
 
+## AWS Benchmarking (benchmark_c7i.sh)
+
+```bash
+./benchmark_c7i.sh                                        # Standard benchmarks (Clang 16, -march=native)
+./benchmark_c7i.sh --filter='BM_EytzingerLookup_10M'     # Single benchmark
+./benchmark_c7i.sh --repetitions=20                        # More repetitions (default: 10)
+./benchmark_c7i.sh --fix-perf                              # Fix broken perf on newer AWS kernels
+./benchmark_c7i.sh --setup-isolation                       # Configure isolcpus=1 (c7i.large, requires reboot)
+./benchmark_c7i.sh --setup-isolation=c7i.xlarge            # Configure isolcpus=1,3 (c7i.xlarge)
+./benchmark_c7i.sh --topdown                               # TMA L1 via toplev.py
+./benchmark_c7i.sh --toplev                                # TMA L2 via toplev.py (default depth 2)
+./benchmark_c7i.sh --toplev --toplev-level=3               # TMA L3
+./benchmark_c7i.sh --toplev --filter='BM_SortedLookup_10M' # TMA on specific benchmark
+```
+
+Always does a clean rebuild with Clang 16. Benchmarks run with `taskset -c 1` on isolated cores. Uses `toplev.py --force-cpu spr` from pmu-tools (cloned to `third_party/pmu-tools`) since AWS kernels lack topdown PMU support.
+
 ## Benchmark Results (WSL2, 10M int64_t keys)
 
 | Layout | Lookup Latency | vs Baseline |
