@@ -259,6 +259,7 @@ if $TOPDOWN_MODE || $TOPLEV_MODE; then
     TOPLEV_OUT="${SCRIPT_DIR}/toplev_results_$(date +%Y%m%d_%H%M%S).txt"
     sudo python3 "${PMU_TOOLS_DIR}/toplev.py" \
         --force-cpu spr --core S0-C0 -l"${TMA_LEVEL}" -v --no-desc \
+        --no-group --no-multiplex \
         taskset -c 1 "${SCRIPT_DIR}/build/llti_benchmarks" \
         --benchmark_filter="${TOPLEV_FILTER}" \
         --benchmark_repetitions=3 \
