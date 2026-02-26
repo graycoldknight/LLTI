@@ -1,0 +1,3 @@
+[submodule "skills/perf"]
+	path = skills/perf
+	url = git@github.com:graycoldknight/claude-perf-skills.git
