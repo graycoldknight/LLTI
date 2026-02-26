@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 namespace llti {
@@ -9,16 +11,16 @@ namespace llti {
 // van Emde Boas (vEB) layout for cache-oblivious binary search.
 //
 // This splits the binary tree recursively into top and bottom subtrees.
-// Unlike Eytzinger which is implicit, we use explicit left/right indices.
+// Unlike Eytzinger which is implicit, we use explicit child indices.
 // To maximize cache efficiency, we pack the key and child indices into a
-// single 16-byte structure (Structure of Arrays).
+// single 16-byte structure (Array of Structs).
+// The int64_t key type is consistent with SortedLookup and EytzingerLookup.
 
 template <typename Value>
 struct VebLookup {
     struct alignas(16) SearchData {
         int64_t key;
-        uint32_t left;
-        uint32_t right;
+        uint32_t children[2]; // [0]=left, [1]=right
     };
 
     std::vector<SearchData> tree;
@@ -32,22 +34,29 @@ struct VebLookup {
         n = entries.size();
         if (n == 0) return;
 
-        int h = 64 - __builtin_clzll(n); // log2(N) + 1
+        if (n + 1 > std::numeric_limits<uint32_t>::max()) {
+            throw std::overflow_error("VebLookup: n exceeds uint32_t index range");
+        }
 
-        std::vector<int> veb_order;
+        // __builtin_clzll is undefined for 0; guarded by n == 0 check above.
+        int h = 64 - __builtin_clzll(n); // ceil(log2(N)) + 1
+
+        // The following 5 temp vectors are a one-time build cost for static data.
+        // Build is O(N) memory and amortized across all subsequent lookups.
+        std::vector<size_t> veb_order;
         veb_order.reserve(n);
         build_veb_complete(1, h, n, veb_order);
 
-        std::vector<int> bfs_to_veb(n + 1);
+        std::vector<size_t> bfs_to_veb(n + 1);
         for (size_t i = 0; i < n; ++i) {
             bfs_to_veb[veb_order[i]] = i + 1; // 1-based index
         }
 
-        std::vector<int> inorder_bfs;
+        std::vector<size_t> inorder_bfs;
         inorder_bfs.reserve(n);
         inorder_complete(1, n, inorder_bfs);
 
-        std::vector<int> bfs_to_sorted(n + 1);
+        std::vector<size_t> bfs_to_sorted(n + 1);
         for (size_t i = 0; i < n; ++i) {
             bfs_to_sorted[inorder_bfs[i]] = i;
         }
@@ -55,21 +64,23 @@ struct VebLookup {
         tree.resize(n + 1);
         vals.resize(n + 1);
 
-        for (int bfs = 1; bfs <= static_cast<int>(n); ++bfs) {
-            int veb_idx = bfs_to_veb[bfs];
-            int sorted_idx = bfs_to_sorted[bfs];
+        for (size_t bfs = 1; bfs <= n; ++bfs) {
+            size_t veb_idx = bfs_to_veb[bfs];
+            size_t sorted_idx = bfs_to_sorted[bfs];
 
             tree[veb_idx].key = entries[sorted_idx].first;
             vals[veb_idx] = entries[sorted_idx].second;
 
-            int left_bfs = 2 * bfs;
-            int right_bfs = 2 * bfs + 1;
+            size_t left_bfs = 2 * bfs;
+            size_t right_bfs = 2 * bfs + 1;
 
-            tree[veb_idx].left = (left_bfs <= static_cast<int>(n)) ? bfs_to_veb[left_bfs] : 0;
-            tree[veb_idx].right = (right_bfs <= static_cast<int>(n)) ? bfs_to_veb[right_bfs] : 0;
+            tree[veb_idx].children[0] = static_cast<uint32_t>(
+                (left_bfs <= n) ? bfs_to_veb[left_bfs] : 0);
+            tree[veb_idx].children[1] = static_cast<uint32_t>(
+                (right_bfs <= n) ? bfs_to_veb[right_bfs] : 0);
         }
 
-        root_idx = bfs_to_veb[1];
+        root_idx = static_cast<uint32_t>(bfs_to_veb[1]);
     }
 
     const Value* find(int64_t target) const {
@@ -79,13 +90,11 @@ struct VebLookup {
         uint32_t candidate = 0;
 
         while (curr != 0) {
+            __builtin_prefetch(&tree[tree[curr].children[0]]);
+            __builtin_prefetch(&tree[tree[curr].children[1]]);
             int64_t key = tree[curr].key;
-            if (target <= key) {
-                candidate = curr;
-                curr = tree[curr].left;
-            } else {
-                curr = tree[curr].right;
-            }
+            candidate = (target <= key) ? curr : candidate;  // CMOV
+            curr = tree[curr].children[key < target];         // branchless select
         }
 
         if (candidate != 0 && tree[candidate].key == target) {
@@ -95,7 +104,7 @@ struct VebLookup {
     }
 
 private:
-    void build_veb_complete(int bfs_idx, int h, int N, std::vector<int>& veb_order) {
+    void build_veb_complete(size_t bfs_idx, int h, size_t N, std::vector<size_t>& veb_order) {
         if (h == 0 || bfs_idx > N) return;
         if (h == 1) {
             veb_order.push_back(bfs_idx);
@@ -106,15 +115,15 @@ private:
 
         build_veb_complete(bfs_idx, top_h, N, veb_order);
 
-        int num_bottom = 1 << top_h;
-        int first_leaf_bfs = bfs_idx * (1 << top_h);
-        for (int i = 0; i < num_bottom; ++i) {
+        size_t num_bottom = size_t{1} << top_h;
+        size_t first_leaf_bfs = bfs_idx * (size_t{1} << top_h);
+        for (size_t i = 0; i < num_bottom; ++i) {
             if (first_leaf_bfs + i > N) break;
             build_veb_complete(first_leaf_bfs + i, bottom_h, N, veb_order);
         }
     }
 
-    void inorder_complete(int bfs_idx, int N, std::vector<int>& inorder_bfs) {
+    void inorder_complete(size_t bfs_idx, size_t N, std::vector<size_t>& inorder_bfs) {
         if (bfs_idx > N) return;
         inorder_complete(2 * bfs_idx, N, inorder_bfs);
         inorder_bfs.push_back(bfs_idx);
