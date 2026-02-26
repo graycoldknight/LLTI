@@ -34,7 +34,7 @@ add_library(llti INTERFACE)
 target_include_directories(llti INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
 # Tests
-add_executable(llti_tests tests/lookup_test.cpp tests/eytzinger_test.cpp)
+add_executable(llti_tests tests/lookup_test.cpp tests/eytzinger_test.cpp tests/veb_test.cpp)
 target_link_libraries(llti_tests PRIVATE llti GTest::gtest_main)
 
 # Benchmarks

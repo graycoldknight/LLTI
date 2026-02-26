@@ -58,3 +58,40 @@ RET              Retiring.Light_Operations           % Slots                    
 2. **Shifted Bottleneck:** Because the pipeline is no longer constantly flushing from bad branch predictions, the CPU is free to actually execute instructions. The bottleneck shifts towards the **Backend Bound (Core Bound at 13.2%)** and **Retiring (Useful Work at 22.7%)**. The CPU is executing the arithmetic instructions as fast as its execution units allow, perfectly overlapping computation with memory fetches.
 
 **Conclusion:** The Eytzinger layout transforms a memory-stalled, heavily mispredicted control-flow problem into a smooth, predictable data-flow pipeline that perfectly utilizes the Sapphire Rapids out-of-order execution engine, resulting in a 4.2x speedup.
+
+## 3. The van Emde Boas (vEB) Layout Performance
+
+We also implemented and benchmarked a cache-oblivious van Emde Boas (vEB) layout. It achieves high performance by recursively splitting the tree into top and bottom subtrees to maximize cache locality. Our implementation uses explicit left/right indices packed into a 16-byte Structure of Arrays (SoA) to avoid implicit bitwise mappings.
+
+### Benchmark Results (10M int64_t keys, Local/WSL2 Equivalent)
+| Layout | Lookup Latency | vs Baseline |
+|--------|---------------|-------------|
+| Sorted + `std::lower_bound` | ~318 ns | baseline |
+| vEB (Explicit indices) | ~118 ns | **2.7x faster** |
+| Eytzinger (BFS) + branchless | ~85.4 ns | **3.7x faster** |
+
+**Analysis:**
+1. **vEB vs Standard Binary Search:** The vEB layout is nearly **3 times faster** than the baseline sorted binary search. By grouping subtrees recursively, traversing the vEB layout drastically reduces the number of cache misses.
+2. **vEB vs Eytzinger:** The Eytzinger layout slightly outperforms the vEB layout in this configuration. Eytzinger is purely implicit—it computes child indices mathematically (`2*i` and `2*i+1`) without needing to fetch explicit `left`/`right` pointers from memory. Our vEB layout must read the explicit 4-byte `left`/`right` indices embedded within its nodes, incurring a small extra memory latency overhead.
+
+Both cache-oblivious layouts perform phenomenally compared to the baseline.
+
+### TMA Analysis: Eytzinger vs vEB
+
+A Top-Down Microarchitecture Analysis (TMA) was performed using `toplev.py` to understand the performance delta between the Eytzinger and vEB layouts. Specifically, we investigated whether the more complex code of the vEB layout was causing instruction cache misses.
+
+| TMA Category | Eytzinger (~92 ns) | vEB (~130 ns) |
+| :--- | :--- | :--- |
+| **Frontend Bound (Fetch Latency / I-Cache)** | 11.1% | **9.9%** |
+| **Backend Bound (Memory Bound)** | 8.8% | **18.2%** |
+| Backend Bound (Core Bound) | 15.4% | 13.8% |
+| Bad Speculation (Branch Mispredicts) | 33.3% | 27.4% |
+
+**Key Findings:**
+
+1. **Instruction Cache is not the bottleneck:** The `Frontend_Bound.Fetch_Latency` metric (which tracks instruction cache misses and decode starvation) is actually *lower* for vEB (9.9%) than Eytzinger (11.1%). The vEB loop compiles to a very tight sequence of instructions that easily fits in the L1-Instruction Cache.
+2. **The Real Bottleneck - Memory Dependency (Pointer Chasing):** The vEB's **Memory Bound** metric is more than double that of Eytzinger (18.2% vs 8.8%). 
+   - **Eytzinger** computes the location of the next child mathematically (`2*i` and `2*i+1`). It doesn't need to read memory to know *where* to look next. This allows the CPU's memory subsystem to overlap fetches and enables software prefetching (`__builtin_prefetch`) to grab the next cache line early.
+   - **vEB** uses explicit `left` and `right` indices stored inside the node. The CPU *must* wait for the current node's cache line to arrive from memory, read the index, and *only then* can it calculate the address of the child and issue the next memory request.
+
+This creates a **serialized dependency chain** for memory accesses. The CPU spends significantly more time stalled waiting for memory to arrive because it cannot look ahead, making vEB slower than Eytzinger despite its optimal spatial locality.

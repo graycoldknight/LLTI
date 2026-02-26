@@ -97,3 +97,45 @@ static void BM_EytzingerLookup_Build(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations() * N);
 }
 BENCHMARK(BM_EytzingerLookup_Build)->Arg(10'000'000);
+
+// --- vEB ---
+#include "llti/veb_lookup.h"
+
+static void BM_VebLookup_10M(benchmark::State& state) {
+    constexpr int64_t N = 10'000'000;
+    auto entries = make_entries(N);
+
+    llti::VebLookup<int64_t> table;
+    table.build(std::move(entries));
+
+    constexpr int BATCH = 1024;
+    std::mt19937_64 rng(99);
+    std::uniform_int_distribution<size_t> dist(1, table.n);
+    std::vector<int64_t> lookup_keys(BATCH);
+    for (int i = 0; i < BATCH; ++i) {
+        lookup_keys[i] = table.tree[dist(rng)].key;
+    }
+
+    int idx = 0;
+    for (auto _ : state) {
+        auto* val = table.find(lookup_keys[idx]);
+        benchmark::DoNotOptimize(val);
+        idx = (idx + 1) & (BATCH - 1);
+    }
+}
+BENCHMARK(BM_VebLookup_10M);
+
+static void BM_VebLookup_Build(benchmark::State& state) {
+    const int64_t N = state.range(0);
+    auto entries = make_entries(N);
+
+    for (auto _ : state) {
+        llti::VebLookup<int64_t> table;
+        auto copy = entries;
+        table.build(std::move(copy));
+        benchmark::DoNotOptimize(table);
+    }
+    state.SetItemsProcessed(state.iterations() * N);
+}
+BENCHMARK(BM_VebLookup_Build)->Arg(10'000'000);
+
