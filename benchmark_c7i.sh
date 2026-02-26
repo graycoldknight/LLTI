@@ -44,7 +44,12 @@ done
 fix_perf() {
     echo "==> Installing linux-tools for perf..."
     sudo apt-get update -qq
-    sudo apt-get install -y -qq "linux-tools-$(uname -r)" linux-tools-aws linux-tools-generic linux-cloud-tools-aws 2>/dev/null || true
+    
+    # Split installs so failure of a specific version doesn't block the meta-package
+    # Use noninteractive to bypass 'needrestart' or kernel upgrade prompts
+    export DEBIAN_FRONTEND=noninteractive
+    sudo -E apt-get install -y -qq linux-tools-aws linux-tools-generic linux-cloud-tools-aws 2>/dev/null || true
+    sudo -E apt-get install -y -qq "linux-tools-$(uname -r)" 2>/dev/null || true
 
     sudo sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0 >/dev/null
 
@@ -71,6 +76,7 @@ fix_perf() {
     fi
 
     sudo ln -sf "$WORKING_PERF" /usr/local/bin/perf
+    hash -r
     if perf stat -- true &>/dev/null; then
         echo "    perf verified: $(perf --version)"
         return 0
@@ -145,11 +151,12 @@ fi
 # ── 1. Install Clang 16 ─────────────────────────────────────────────
 echo "==> Installing Clang 16..."
 if ! command -v clang++-16 &>/dev/null; then
+    export DEBIAN_FRONTEND=noninteractive
     sudo rm -f /etc/apt/sources.list.d/llvm-16.list
     sudo apt-get update -qq
-    sudo apt-get install -y -qq lsb-release wget software-properties-common gnupg cmake git build-essential python3-pip
+    sudo -E apt-get install -y -qq lsb-release wget software-properties-common gnupg cmake git build-essential python3-pip
 
-    if sudo apt-get install -y -qq clang-16 lld-16 2>/dev/null; then
+    if sudo -E apt-get install -y -qq clang-16 lld-16 2>/dev/null; then
         echo "    Installed clang-16 from default repos."
     else
         wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg 2>/dev/null || true
@@ -157,7 +164,7 @@ if ! command -v clang++-16 &>/dev/null; then
         echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/${CODENAME}/ llvm-toolchain-${CODENAME}-16 main" \
             | sudo tee /etc/apt/sources.list.d/llvm-16.list >/dev/null
         sudo apt-get update -qq
-        sudo apt-get install -y -qq clang-16 lld-16
+        sudo -E apt-get install -y -qq clang-16 lld-16
     fi
 else
     echo "    clang++-16 already installed: $(clang++-16 --version | head -1)"
