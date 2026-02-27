@@ -1,0 +1,132 @@
+ Critique of OrderBook.cpp — 5 Performance Perspectives
+                                                                                
+  class OrderBook {
+  private:                                                                                                                                                                                                            
+      std::vector<double> prices;
+      std::vector<int32_t> quantities;                                                                                                                                                                                
+      std::vector<uint64_t> order_ids;                                                                                                                                                                              
+      std::vector<char[8]> symbols;
+      std::vector<uint64_t> active_flags;
+
+  public:
+      int32_t get_volume_at_price(double target_price) {
+          int32_t total_volume = 0;
+          size_t num_orders = prices.size();
+          for (size_t i = 0; i < num_orders; ++i) {
+              if (is_active(i) && prices[i] == target_price) {
+                  total_volume += quantities[i];
+              }
+          }
+          return total_volume;
+      }
+  };
+
+  ---
+  1. Memory Tuning — Data Locality & Cache Efficiency
+
+  Good: SoA (Structure of Arrays) layout — prices, quantities, etc. are separate vectors. This is the right instinct.
+
+  Problems:
+
+  - Wasted cache lines. The hot loop only touches prices, quantities, and active_flags, but the class also stores order_ids and symbols interleaved in memory allocation order. This isn't harmful per se (they're
+  separate vectors), but the real issue is that you're doing a full linear scan over prices[] — for 10M orders, that's 80 MB of double data streaming through the cache. This will blow L1/L2/L3 and become entirely
+  memory-bandwidth bound.
+  - Two separate arrays touched per iteration. Each iteration accesses active_flags (for is_active(i)) AND prices[i] — that's two separate cache line streams. If active_flags is a bitset (1 bit per order), this is
+  tolerable. If it's one uint64_t per order, that's another 80 MB stream.
+  - No prefetching. A linear scan is actually prefetcher-friendly (hardware sequential prefetch should kick in), but the dual-stream access (active_flags + prices) may saturate prefetch bandwidth.
+
+  Fix: Don't scan — use a price-indexed structure (e.g., std::unordered_map<int64_t, int32_t> mapping price ticks to aggregate volume) maintained incrementally on insert/cancel. O(1) lookup instead of O(N) scan.
+
+  ---
+  2. Branch Tuning — Bad Speculation
+
+  Problems:
+
+  - Two unpredictable branches per iteration. is_active(i) and prices[i] == target_price are both data-dependent conditions. For a large order book where most orders are active but only a few match the target
+  price, the price comparison will mispredict frequently (rare true, common false — but the pattern is random).
+  - Short-circuit && creates a dependency. The compiler may emit a branch for is_active(i) that gates whether prices[i] is even loaded. This serializes the two checks instead of allowing speculative execution of
+  both.
+
+  Fix (if you keep the scan):
+  // Branchless accumulation — no mispredicts
+  uint32_t match = is_active_branchless(i) & (prices[i] == target_price);
+  total_volume += match * quantities[i];
+  This converts both conditions into a branchless mask and uses multiplication to conditionally accumulate. The compiler can emit CMOV or just use integer multiply — zero branch mispredicts.
+
+  ---
+  3. Code Layout Tuning — Frontend / I-Cache
+
+  Low concern for this code — the hot loop is tiny (a few instructions) and will fit in L1 I-cache easily. However:
+
+  - is_active() is not shown. If it's a non-inlined function call, that's a function call per iteration in a tight loop — massive frontend overhead from call/return and potential I-cache miss if the function body
+  lives on a different page.
+  - double comparison — prices[i] == target_price on double may emit x87 or SSE comparison instructions with ucomisd + jp (jump on parity for NaN check), which adds extra branches the frontend must decode.
+
+  Fix: Ensure is_active() is inline or __attribute__((always_inline)). Represent prices as int64_t ticks (e.g., price * 10000) to avoid floating-point comparison overhead and NaN edge cases.
+
+  ---
+  4. TMA Analysis — Predicted Bottleneck Profile
+
+  If you ran this through toplev.py, here's what I'd expect:
+
+  ┌────────────────────────┬────────────┬─────────────────────────────────────────────────────────────────────────────────────┐
+  │       TMA Bucket       │ Expected % │                                         Why                                         │
+  ├────────────────────────┼────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+  │ Backend Bound (Memory) │ 50-60%     │ Dominant. Linear scan over 80MB+ of data — streaming L3 misses on every cache line. │
+  ├────────────────────────┼────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+  │ Bad Speculation        │ 15-25%     │ Two data-dependent branches per iteration with random patterns.                     │
+  ├────────────────────────┼────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+  │ Frontend Bound         │ 5-10%      │ Small loop body, should be fine unless is_active() is out-of-line.                  │
+  ├────────────────────────┼────────────┼─────────────────────────────────────────────────────────────────────────────────────┤
+  │ Retiring               │ 10-20%     │ Low useful work — most cycles are waiting for memory.                               │
+  └────────────────────────┴────────────┴─────────────────────────────────────────────────────────────────────────────────────┘
+
+  The TMA would tell you: This is a Memory Bound problem. The algorithm is wrong for the workload. No amount of micro-optimization fixes an O(N) scan over 10M entries.
+
+  Fix: Maintain a std::unordered_map<PriceTick, int32_t> of aggregated volume per price level, updated incrementally. Lookup becomes O(1) with a single cache miss instead of millions.
+
+  ---
+  5. Xpedite — How to Measure It
+
+  If you wanted to measure this precisely with Xpedite:
+
+  for (size_t batch = 0; batch < num_queries; ++batch) {
+      XPEDITE_TXN_SCOPE("VolumeQuery");  // Begin + End probes
+      auto vol = book.get_volume_at_price(query_prices[batch]);
+      asm volatile("" : : "r,m"(&vol) : "memory");
+  }
+
+  Configure profileInfo.py with these PMU events to diagnose:
+  pmc = [
+      Event('Instructions',      'INST_RETIRED.ANY'),
+      Event('Cycles',            'CPU_CLK_UNHALTED.THREAD'),
+      Event('L1D Misses',        'MEM_LOAD_RETIRED.L1_MISS'),
+      Event('LLC Misses',        'MEM_LOAD_RETIRED.L3_MISS'),
+      Event('Branch Mispredict', 'BR_MISP_RETIRED.ALL_BRANCHES'),
+  ]
+
+  Expected Xpedite results for 10M orders:
+  - P50 latency: ~5-10 ms per query (full scan)
+  - L1D Misses/Instructions: very high (>5%)
+  - LLC Misses: dominant cost
+  - IPC: < 0.5 (memory-starved pipeline)
+
+  ---
+  Summary — Ranked by Impact
+
+  ┌──────────┬───────────────────────────────────────────┬──────────────────────┬─────────────────────────────────────┐
+  │ Priority │                   Issue                   │        Skill         │                 Fix                 │
+  ├──────────┼───────────────────────────────────────────┼──────────────────────┼─────────────────────────────────────┤
+  │ 1        │ O(N) linear scan over millions of entries │ Memory               │ Replace with O(1) price-level index │
+  ├──────────┼───────────────────────────────────────────┼──────────────────────┼─────────────────────────────────────┤
+  │ 2        │ double price comparison (NaN, precision)  │ Code Layout / Branch │ Use int64_t tick prices             │
+  ├──────────┼───────────────────────────────────────────┼──────────────────────┼─────────────────────────────────────┤
+  │ 3        │ Two unpredictable branches per iteration  │ Branch               │ Branchless accumulation             │
+  ├──────────┼───────────────────────────────────────────┼──────────────────────┼─────────────────────────────────────┤
+  │ 4        │ is_active() possibly not inlined          │ Code Layout          │ Mark inline / always_inline         │
+  ├──────────┼───────────────────────────────────────────┼──────────────────────┼─────────────────────────────────────┤
+  │ 5        │ No way to measure per-query latency       │ Xpedite              │ Add probe instrumentation           │
+  └──────────┴───────────────────────────────────────────┴──────────────────────┴─────────────────────────────────────┘
+
+  The fundamental problem is algorithmic — this is a linear scan masquerading as a lookup. The micro-optimizations (branchless, prefetch, layout) that work well in this repo's Eytzinger/vEB implementations assume
+  you've already chosen the right data structure. Here, the right structure is an incrementally-maintained price-level aggregation, not a scan.

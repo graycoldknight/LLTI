@@ -190,7 +190,65 @@ flowchart TD
 3. **Default loading** iterates all registered components but skips `"x86"` because it is blacklisted.
 4. The linux/sysfs backend (priority ~30) becomes the highest-priority CPU discovery component. It reads topology from `/sys/devices/system/cpu/` — virtual files served by the kernel, requiring no privileged CPU instructions.
 
-## 7. Code References
+## 7. Why This Only Appears on RHEL 9 (Not RHEL 7)
+
+This crash is a RHEL 9 regression — the same RRM configuration worked fine on RHEL 7. Three changes between RHEL 7 and RHEL 9 stack together to turn a benign race into a hard crash.
+
+### 7a. hwloc 1.11 → 2.4 (the biggest factor)
+
+| | RHEL 7 | RHEL 9 |
+|---|---|---|
+| **hwloc package** | 1.11.8 (`libhwloc.so.5`) | 2.4.1 (`libhwloc.so.15`) |
+| **x86 backend** | Simpler — probed local core's CPUID, relied on linux/sysfs for remote cores | Rewritten — `look_procs()` **binds to every logical CPU** and executes CPUID on each one |
+| **Strict binding** | Used less aggressively in discovery | `set_cpubind(HWLOC_CPUBIND_STRICT)` — hard-fails if bind is denied |
+
+hwloc 2.x significantly rewrote the x86 discovery backend. In 1.11.x, the x86 component was simpler and fell back gracefully. In 2.x, the `look_procs()` loop at line ~1322 explicitly iterates every logical CPU with strict binding — this is the code path that crashes on RRM-isolated cores.
+
+Verify on your RHEL 9 box:
+
+```bash
+rpm -q hwloc htop
+ldd $(which htop) | grep hwloc
+# Should show libhwloc.so.15 → hwloc 2.x
+```
+
+### 7b. Kernel Lockdown LSM (new in RHEL 9)
+
+RHEL 9 ships with the [Kernel Lockdown LSM](https://www.man7.org/linux/man-pages/man7/kernel_lockdown.7.html) enabled by default (not present in RHEL 7). When Secure Boot is active or lockdown is set to `integrity` mode, **direct MSR access is restricted**:
+
+> "modifying of x86 MSR registers is restricted" — `kernel_lockdown(7)`
+
+This means:
+- **RHEL 7**: hwloc could read MSRs via `/dev/cpu/*/msr` even on cores RRM was managing — it might get stale data but wouldn't crash
+- **RHEL 9**: the lockdown LSM denies MSR reads entirely, turning a "silent wrong answer" into a hard `EACCES` or signal
+
+Check your lockdown state:
+
+```bash
+cat /sys/kernel/security/lockdown
+# [none] integrity confidentiality
+```
+
+### 7c. cgroup v2 (RHEL 9 default) vs cgroup v1 (RHEL 7)
+
+| | RHEL 7 | RHEL 9 |
+|---|---|---|
+| **cgroups** | v1 (hybrid) | v2 (unified, default) |
+| **cpuset behavior** | Permissive — `sched_setaffinity()` to an isolated core often silently succeeds | Stricter — unified hierarchy enforces cpuset boundaries, `sched_setaffinity()` returns `EINVAL` |
+
+Under cgroup v2, if RRM has placed isolated cores into a restricted cpuset, hwloc's `set_cpubind(cpu_i, HWLOC_CPUBIND_STRICT)` is more likely to fail hard rather than silently succeed. hwloc 2.x treats this strict bind failure differently than 1.x — depending on the code path, it may not handle the error gracefully.
+
+### Summary: Three layers of forgiveness removed
+
+On RHEL 7, three layers of forgiveness worked in your favor:
+
+1. **hwloc 1.11** didn't aggressively bind-and-probe every core
+2. **No kernel lockdown** — MSR access silently worked even if data was stale
+3. **cgroup v1** was permissive about cross-cpuset affinity calls
+
+On RHEL 9, all three tightened simultaneously — hwloc 2.x probes harder, lockdown blocks MSR access, and cgroup v2 enforces stricter CPU affinity — turning what was a benign race into a crash.
+
+## 8. Code References
 
 | Component | File | Key Function | Link |
 |---|---|---|---|
@@ -201,7 +259,7 @@ flowchart TD
 | htop hwloc usage | `linux/Platform.c` | `hwloc_topology_init()` / `hwloc_topology_load()` | [htop repo](https://github.com/htop-dev/htop) |
 | Original issue | GitHub | Discussion of `-x86` workaround | [hwloc#474](https://github.com/open-mpi/hwloc/issues/474) |
 
-## 8. Operational Recommendation
+## 9. Operational Recommendation
 
 On any server where Redline RRM (or similar core-isolation software) manages CPU resources, add this to the shell profile or systemd unit for monitoring tools:
 

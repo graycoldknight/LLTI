@@ -50,17 +50,33 @@ Always does a clean rebuild with Clang 16. Benchmarks run with `taskset -c 1` on
 
 ## Benchmark Results (10M int64_t keys)
 
+### AWS c7i (Intel Sapphire Rapids, Isolated Core)
+| Layout | Lookup Latency | vs Baseline | vs Eytzinger |
+|--------|---------------|-------------|--------------|
+| Sorted + `std::lower_bound` | 322 ns | baseline | 5.0x slower |
+| **Eytzinger (BFS) + branchless** | **64.7 ns** | **5.0x faster** | **baseline** |
+| vEB + branchless + prefetch | 97.0 ns | 3.3x faster | 1.5x slower |
+
 ### WSL2 (Local)
 | Layout | Lookup Latency | vs Baseline |
 |--------|---------------|-------------|
 | Sorted + `std::lower_bound` | 292 ns | baseline |
 | Eytzinger (BFS) + branchless | 145 ns | **2.0x faster** |
 
-### AWS c7i (Intel Sapphire Rapids, Isolated Core)
-| Layout | Lookup Latency | vs Baseline |
-|--------|---------------|-------------|
-| Sorted + `std::lower_bound` | 322 ns | baseline |
-| Eytzinger (BFS) + branchless | 76.1 ns | **4.2x faster** |
+### TMA L2 Analysis — Eytzinger vs vEB (AWS c7i, toplev.py)
+
+| TMA Metric | Eytzinger (64.7ns) | vEB (97.0ns) | Interpretation |
+|------------|-------------------|-------------|----------------|
+| Frontend Bound | 29.7% | 25.0% | vEB slightly better |
+| Bad Speculation | 26.8% | 21.0% | Both branchless; residual from loop exit mispredict |
+| **Backend Bound** | **28.9%** | **37.4%** | **vEB significantly worse** |
+| → Memory_Bound | 11.0% | **21.8%** | **2x worse — dominant bottleneck for vEB** |
+| → Core_Bound | 17.8% | 15.6% | Similar |
+| Retiring | 14.8% | 16.7% | Both low (pointer-chasing limits IPC) |
+
+**Why vEB loses despite cache-oblivious layout:**
+1. **2x working set** — vEB stores 16 bytes/node (key + explicit child indices) vs Eytzinger's 8 bytes/node (key only, implicit `2i`/`2i+1` children). Fewer cache lines fit in L2/L3.
+2. **Dependent prefetch chain** — Eytzinger computes prefetch addresses via arithmetic (`2*i`), completely hiding memory latency. vEB must load `tree[curr]` to discover child addresses, creating a pointer-chasing dependency that defeats prefetching.
 
 ## Architecture
 
@@ -68,7 +84,7 @@ Header-only library in `include/llti/`.
 
 - **`sorted_lookup.h`** — Naive sorted array with `std::lower_bound` binary search. Baseline implementation.
 - **`eytzinger_lookup.h`** — Eytzinger (BFS) layout with branchless search and software prefetch. Keys are stored in breadth-first order of an implicit binary tree (1-indexed: node `i` has children `2i`, `2i+1`). The search loop is branchless: `i = 2*i + (keys[i] < target)` with `__builtin_prefetch` to hide memory latency. After descent, the answer is recovered via `i >>= __builtin_ffs(~i)`. Build uses in-order recursive fill from sorted input.
-- **`veb_lookup.h`** — van Emde Boas (vEB) cache-oblivious layout. Recursively splits the binary tree into top/bottom subtrees. Uses explicit child pointers packed into a 16-byte aligned `SearchData` struct (key + left/right indices). Search is branching (not branchless). Build maps BFS indices to vEB order via recursive layout generation.
+- **`veb_lookup.h`** — van Emde Boas (vEB) cache-oblivious layout. Recursively splits the binary tree into top/bottom subtrees. Uses explicit child indices packed into a 16-byte aligned `SearchData` struct (key + `children[2]`). Search is branchless with dual prefetch. Build maps BFS indices to vEB order via recursive layout generation. Despite cache-oblivious layout, 50% slower than Eytzinger due to 2x working set and dependent prefetch chain (see TMA analysis above).
 
 ## Performance Tuning Skills
 
