@@ -2,13 +2,20 @@
 
 ## 1. Problem Statement
 
-On trading servers running Redline Realtime Manager (RRM), `htop` segfaults or hangs on startup — but only if launched **after** RRM. If `htop` is started first, it works fine. The workaround is a single environment variable:
+On trading servers running Redline Realtime Manager (RRM), `htop` segfaults or hangs on startup — but only if launched **after** RRM. This issue is a significant regression observed during RHEL 9 migrations; the same configuration worked reliably on RHEL 7.
+
+The crash is not limited to `htop`. Any tool using `libhwloc` for hardware discovery is affected, including:
+- `lstopo` (topology visualization)
+- `mpirun` / `orterun` (Open MPI process launchers)
+- High-performance computing (HPC) schedulers
+
+The standard workaround is a single environment variable:
 
 ```bash
 export HWLOC_COMPONENTS=-x86
 ```
 
-This article traces the crash from `htop`'s process entry through `libhwloc`'s component system down to the inline assembly instruction that faults, explains why the ordering dependency exists, and shows exactly how the environment variable disables the offending code path.
+This article traces the crash from `htop`'s process entry through `libhwloc`'s component system down to the inline assembly instruction that faults, explains why the RHEL 9 environment triggers this failure, and shows exactly how the environment variable disables the offending code path.
 
 ## 2. Software Stack
 
@@ -83,6 +90,12 @@ static __hwloc_inline void hwloc_x86_cpuid(unsigned *eax, unsigned *ebx,
 
 This probes cache topology (CPUID leaves 0x02, 0x04), thread/core hierarchy (leaf 0x0B/0x1F), and extended features — all by executing privileged-adjacent instructions directly on the CPU.
 
+In `libhwloc` 2.x, the x86 backend also attempts to read Model-Specific Registers (MSRs) via `/dev/cpu/*/msr` to determine:
+- **Package-level power limits** (RAPL)
+- **Actual vs. Nominal clock speeds** (APERF/MPERF)
+
+While this provides richer data for `htop`, these registers are strictly protected under RRM/Lockdown environments.
+
 ## 4. What RRM Does at the Hardware Level
 
 Redline Realtime Manager achieves zero-jitter execution for trading engines by fundamentally altering the operating environment of isolated cores:
@@ -119,10 +132,10 @@ sequenceDiagram
         x86->>cpu: set_cpubind(cpu_i, STRICT)
         cpu-->>x86: OK (bound to isolated core)
         x86->>cpu: CPUID (inline asm)
-        cpu-->>x86: SIGILL / SIGSEGV / hang
+        cpu-->>x86: SIGILL / SIGSEGV / hang (Uninterruptible Sleep)
     end
 
-    Note over htop: Process killed by signal<br>before UI is ever painted
+    Note over htop: Process killed by signal<br>or frozen in "D" state
 ```
 
 ### Why launching htop *before* RRM works
@@ -207,7 +220,11 @@ hwloc 2.x significantly rewrote the x86 discovery backend. In 1.11.x, the x86 co
 Verify on your RHEL 9 box:
 
 ```bash
-rpm -q hwloc htop
+# Check the hwloc library version
+hwloc-info --version
+# Output: hwloc-info 2.x.x
+
+# Check the dynamic links of htop
 ldd $(which htop) | grep hwloc
 # Should show libhwloc.so.15 → hwloc 2.x
 ```
@@ -219,8 +236,8 @@ RHEL 9 ships with the [Kernel Lockdown LSM](https://www.man7.org/linux/man-pages
 > "modifying of x86 MSR registers is restricted" — `kernel_lockdown(7)`
 
 This means:
-- **RHEL 7**: hwloc could read MSRs via `/dev/cpu/*/msr` even on cores RRM was managing — it might get stale data but wouldn't crash
-- **RHEL 9**: the lockdown LSM denies MSR reads entirely, turning a "silent wrong answer" into a hard `EACCES` or signal
+- **RHEL 7**: hwloc could read MSRs via `/dev/cpu/*/msr` even on cores RRM was managing — it might get stale data but wouldn't crash.
+- **RHEL 9**: The lockdown LSM denies MSR reads entirely. While `libhwloc` tries to handle `EACCES` gracefully, the combination of aggressive CPU binding and restricted register access can trigger a signal or process hang if the kernel LSM implementation is not expecting a discovery loop on an isolated core.
 
 Check your lockdown state:
 
@@ -275,3 +292,18 @@ Environment="HWLOC_COMPONENTS=-x86"
 ```
 
 This disables hwloc's direct silicon probing across all tools that link against `libhwloc` — not just `htop`, but also `lstopo`, Open MPI, and any other hwloc consumer. The linux/sysfs backend provides identical topology information for monitoring purposes; the only lost capability is CPUID-level cache detail that the kernel already exposes via sysfs on modern kernels (4.x+).
+
+### Alternative: XML Topology
+For users who still want high-detail topology visualization but need to avoid the live hardware probe, `libhwloc` can load a static XML topology file:
+
+1. **Generate the XML** once (e.g., during system boot or before starting RRM):
+   ```bash
+   lstopo-no-graphics topology.xml
+   ```
+2. **Load the XML** for subsequent tool calls:
+   ```bash
+   export HWLOC_XMLFILE=topology.xml
+   # OR use the --input flag with lstopo
+   lstopo --input topology.xml
+   ```
+This avoids the x86 backend discovery loop entirely while preserving full cache and socket details.
