@@ -1,10 +1,10 @@
-# Why htop Crashes After Redline RRM — A Code-Level Root Cause Analysis
+# Why htop Hangs After Redline RRM — A Code-Level Root Cause Analysis
 
 ## 1. Problem Statement
 
-On trading servers running Redline Realtime Manager (RRM), `htop` segfaults or hangs on startup — but only if launched **after** RRM. This issue is a significant regression observed during RHEL 9 migrations; the same configuration worked reliably on RHEL 7.
+On trading servers running Redline Realtime Manager (RRM), `htop` hangs on startup — but only if launched **after** RRM. This issue is a significant regression observed during RHEL 9 migrations; the same configuration worked reliably on RHEL 7.
 
-The crash is not limited to `htop`. Any tool using `libhwloc` for hardware discovery is affected, including:
+The hang is not limited to `htop`. Any tool using `libhwloc` for hardware discovery is affected, including:
 - `lstopo` (topology visualization)
 - `mpirun` / `orterun` (Open MPI process launchers)
 - High-performance computing (HPC) schedulers
@@ -15,15 +15,15 @@ The standard workaround is a single environment variable:
 export HWLOC_COMPONENTS=-x86
 ```
 
-This article traces the crash from `htop`'s process entry through `libhwloc`'s component system down to the inline assembly instruction that faults, explains why the RHEL 9 environment triggers this failure, and shows exactly how the environment variable disables the offending code path.
+This article traces the issue from `htop`'s process entry through `libhwloc`'s component system down to the inline assembly instruction that faults, explains why the RHEL 9 environment triggers this failure, and shows exactly how the environment variable disables the offending code path.
 
 ## 2. Software Stack
 
 ```mermaid
 graph TD
     A[htop] -->|"hwloc_topology_init()<br>hwloc_topology_load()"| B["libhwloc.so.15<br>(hwloc 2.x)"]
+    B -->|"priority 50"| D["linux backend<br>topology-linux.c"]
     B -->|"priority 45"| C["x86 backend<br>topology-x86.c"]
-    B -->|"priority 30"| D["linux backend<br>topology-linux.c"]
     C -->|"inline asm: CPUID<br>read /dev/cpu/*/msr"| E["Hardware<br>(CPU registers, MSRs)"]
     D -->|"read()"| F["Kernel VFS<br>/sys/devices/system/cpu/"]
     style C fill:#ff6b6b,color:#fff
@@ -32,9 +32,20 @@ graph TD
     style F fill:#51cf66,color:#fff
 ```
 
-The red path crashes under RRM. The green path is safe — it reads virtual files only.
+The red path hangs on startup under RRM. The green path is safe — it reads virtual files only.
 
-## 3. hwloc Discovery Architecture
+## 3. Why Priority Matters
+
+`hwloc` sorts its discovery components by priority and executes them in descending order. This determines whether a backend **creates** the topology or simply **enriches** it.
+
+| Component | Priority | Role in Discovery |
+|---|---|---|
+| **linux** | **50** | **Primary.** Creates the base topology by reading `/sys` and `/proc`. Because it is "Native OS" priority, it runs first and is generally safe. |
+| **x86** | **45** | **Augmenting.** Runs *after* the OS backend. Its job is to "fill in the blanks" (like L1/L2 cache relationships) by talking directly to the silicon. |
+
+The hang occurs because the x86 backend (45) does not stop just because the Linux backend (50) succeeded. It proceeds to bind a thread to every isolated core and execute `CPUID` to "improve" the data it already has. By the time it reaches the x86 phase, the environment is already "poisoned" by RRM, leading to the hang.
+
+## 4. hwloc Discovery Architecture
 
 hwloc uses a **component-based plugin system** with priority ordering. Each discovery component registers a struct declaring its name, phase, and priority. During `hwloc_topology_load()`, components are instantiated in priority order (highest first) and each runs its discovery phase.
 
@@ -52,7 +63,7 @@ static struct hwloc_disc_component hwloc_x86_disc_component = {
 };
 ```
 
-**Priority 45** means the x86 backend runs before the linux/sysfs backend (priority ~30). Because `enabled_by_default` is `1`, it will always be loaded unless explicitly excluded.
+**Priority 45** means the x86 backend runs after the linux/sysfs backend (priority 50). Because `enabled_by_default` is `1`, it will always be loaded unless explicitly excluded.
 
 ### What the x86 backend does
 
@@ -96,7 +107,7 @@ In `libhwloc` 2.x, the x86 backend also attempts to read Model-Specific Register
 
 While this provides richer data for `htop`, these registers are strictly protected under RRM/Lockdown environments.
 
-## 4. What RRM Does at the Hardware Level
+## 5. What RRM Does at the Hardware Level
 
 Redline Realtime Manager achieves zero-jitter execution for trading engines by fundamentally altering the operating environment of isolated cores:
 
@@ -112,7 +123,7 @@ The critical conflict: hwloc's `look_procs()` loop binds to **every** logical CP
 - Disabled interrupt delivery (thread hangs — no signal can kill it)
 - Modified CPU state that makes topology enumeration return garbage or trap
 
-## 5. Root Cause: The Crash Sequence
+## 6. Root Cause: The Hang Sequence
 
 ```mermaid
 sequenceDiagram
@@ -142,7 +153,7 @@ sequenceDiagram
 
 When `htop` starts first, `hwloc_topology_load()` completes its full silicon probe across all cores while they are still in normal operating mode. The topology is cached in the `hwloc_topology` struct in process memory. By the time RRM locks down cores, `htop` is in its main loop reading `/proc/stat` for CPU utilization — it never calls `hwloc_topology_load()` again.
 
-## 6. The Fix: Tracing Through `components.c`
+## 7. The Fix: Tracing Through `components.c`
 
 The environment variable `HWLOC_COMPONENTS=-x86` is processed in [`hwloc_disc_components_enable_others()`](https://github.com/open-mpi/hwloc/blob/master/hwloc/components.c#L917) in `components.c`.
 
@@ -201,13 +212,13 @@ flowchart TD
 1. **Pass 1** finds token `-x86`. The `'-'` prefix triggers `hwloc_disc_component_blacklist_one("x86")`, which marks the x86 component as excluded. The token characters are overwritten with commas so Pass 2 skips them.
 2. **Pass 2** finds no remaining tokens. `tryall` stays `1`.
 3. **Default loading** iterates all registered components but skips `"x86"` because it is blacklisted.
-4. The linux/sysfs backend (priority ~30) becomes the highest-priority CPU discovery component. It reads topology from `/sys/devices/system/cpu/` — virtual files served by the kernel, requiring no privileged CPU instructions.
+4. The linux/sysfs backend (priority 50) becomes the highest-priority CPU discovery component. It reads topology from `/sys/devices/system/cpu/` — virtual files served by the kernel, requiring no privileged CPU instructions.
 
-## 7. Why This Only Appears on RHEL 9 (Not RHEL 7)
+## 8. Why This Only Appears on RHEL 9 (Not RHEL 7)
 
-This crash is a RHEL 9 regression — the same RRM configuration worked fine on RHEL 7. Three changes between RHEL 7 and RHEL 9 stack together to turn a benign race into a hard crash.
+This hang is a RHEL 9 regression — the same RRM configuration worked fine on RHEL 7. Three changes between RHEL 7 and RHEL 9 stack together to turn a benign race into a hard hang.
 
-### 7a. hwloc 1.11 → 2.4 (the biggest factor)
+### 8a. hwloc 1.11 → 2.4 (the biggest factor)
 
 | | RHEL 7 | RHEL 9 |
 |---|---|---|
@@ -215,7 +226,7 @@ This crash is a RHEL 9 regression — the same RRM configuration worked fine on 
 | **x86 backend** | Simpler — probed local core's CPUID, relied on linux/sysfs for remote cores | Rewritten — `look_procs()` **binds to every logical CPU** and executes CPUID on each one |
 | **Strict binding** | Used less aggressively in discovery | `set_cpubind(HWLOC_CPUBIND_STRICT)` — hard-fails if bind is denied |
 
-hwloc 2.x significantly rewrote the x86 discovery backend. In 1.11.x, the x86 component was simpler and fell back gracefully. In 2.x, the `look_procs()` loop at line ~1322 explicitly iterates every logical CPU with strict binding — this is the code path that crashes on RRM-isolated cores.
+hwloc 2.x significantly rewrote the x86 discovery backend. In 1.11.x, the x86 component was simpler and fell back gracefully. In 2.x, the `look_procs()` loop at line ~1322 explicitly iterates every logical CPU with strict binding — this is the code path that hangs on RRM-isolated cores.
 
 Verify on your RHEL 9 box:
 
@@ -229,14 +240,14 @@ ldd $(which htop) | grep hwloc
 # Should show libhwloc.so.15 → hwloc 2.x
 ```
 
-### 7b. Kernel Lockdown LSM (new in RHEL 9)
+### 8b. Kernel Lockdown LSM (new in RHEL 9)
 
 RHEL 9 ships with the [Kernel Lockdown LSM](https://www.man7.org/linux/man-pages/man7/kernel_lockdown.7.html) enabled by default (not present in RHEL 7). When Secure Boot is active or lockdown is set to `integrity` mode, **direct MSR access is restricted**:
 
 > "modifying of x86 MSR registers is restricted" — `kernel_lockdown(7)`
 
 This means:
-- **RHEL 7**: hwloc could read MSRs via `/dev/cpu/*/msr` even on cores RRM was managing — it might get stale data but wouldn't crash.
+- **RHEL 7**: hwloc could read MSRs via `/dev/cpu/*/msr` even on cores RRM was managing — it might get stale data but wouldn't hang.
 - **RHEL 9**: The lockdown LSM denies MSR reads entirely. While `libhwloc` tries to handle `EACCES` gracefully, the combination of aggressive CPU binding and restricted register access can trigger a signal or process hang if the kernel LSM implementation is not expecting a discovery loop on an isolated core.
 
 Check your lockdown state:
@@ -246,7 +257,7 @@ cat /sys/kernel/security/lockdown
 # [none] integrity confidentiality
 ```
 
-### 7c. cgroup v2 (RHEL 9 default) vs cgroup v1 (RHEL 7)
+### 8c. cgroup v2 (RHEL 9 default) vs cgroup v1 (RHEL 7)
 
 | | RHEL 7 | RHEL 9 |
 |---|---|---|
@@ -263,9 +274,9 @@ On RHEL 7, three layers of forgiveness worked in your favor:
 2. **No kernel lockdown** — MSR access silently worked even if data was stale
 3. **cgroup v1** was permissive about cross-cpuset affinity calls
 
-On RHEL 9, all three tightened simultaneously — hwloc 2.x probes harder, lockdown blocks MSR access, and cgroup v2 enforces stricter CPU affinity — turning what was a benign race into a crash.
+On RHEL 9, all three tightened simultaneously — hwloc 2.x probes harder, lockdown blocks MSR access, and cgroup v2 enforces stricter CPU affinity — turning what was a benign race into a hang.
 
-## 8. Code References
+## 9. Code References
 
 | Component | File | Key Function | Link |
 |---|---|---|---|
@@ -276,7 +287,7 @@ On RHEL 9, all three tightened simultaneously — hwloc 2.x probes harder, lockd
 | htop hwloc usage | `linux/Platform.c` | `hwloc_topology_init()` / `hwloc_topology_load()` | [htop repo](https://github.com/htop-dev/htop) |
 | Original issue | GitHub | Discussion of `-x86` workaround | [hwloc#474](https://github.com/open-mpi/hwloc/issues/474) |
 
-## 9. Operational Recommendation
+## 10. Operational Recommendation
 
 On any server where Redline RRM (or similar core-isolation software) manages CPU resources, add this to the shell profile or systemd unit for monitoring tools:
 
